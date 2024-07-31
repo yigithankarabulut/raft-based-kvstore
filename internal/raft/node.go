@@ -3,6 +3,7 @@ package raft
 import (
 	"log"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -61,6 +62,7 @@ type Node struct {
 	electionTimeout time.Duration
 	PeerChan        map[string]chan RPCMessage
 	doneCh          chan struct{}
+	mu              sync.Mutex
 }
 
 // NewNode creates a new Raft node with the given ID, peers, and peer channels
@@ -79,6 +81,7 @@ func NewNode(id string, peers []string, peerChan map[string]chan RPCMessage) *No
 		electionTimeout: time.Duration(rand.Intn(150)+150) * time.Millisecond, //nolint:gosec
 		PeerChan:        peerChan,
 		doneCh:          make(chan struct{}),
+		mu:              sync.Mutex{},
 	}
 
 	for _, peer := range peers {
@@ -265,6 +268,15 @@ func (n *Node) becomeLeader() {
 	log.Printf("[%s] Becoming leader\n", n.id)
 	n.state = Leader
 
+	n.appendEntries(nil)
+
+	for _, peer := range n.peers {
+		if peer != n.id {
+			n.nextIndex[peer] = uint64(len(n.log))
+			n.matchIndex[peer] = 0
+		}
+	}
+
 	go n.startHeartbeat()
 }
 
@@ -345,6 +357,8 @@ func (n *Node) updateCommitIndex() {
 			if matchCount > len(n.peers)/2 {
 				n.commitIndex = i
 				go n.applyCommittedEntries()
+			} else {
+				break // Entries are not replicated on majority of servers
 			}
 		}
 	}

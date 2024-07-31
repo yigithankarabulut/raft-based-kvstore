@@ -89,6 +89,8 @@ func (n *Node) handleRPC(msg RPCMessage) {
 
 // RequestVote is called by candidates to request votes from other nodes in the cluster.
 func (n *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if args.Term < n.currentTerm {
 		reply.Term = n.currentTerm
 		reply.VoteGranted = false
@@ -102,6 +104,7 @@ func (n *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error 
 		n.isLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
 		reply.VoteGranted = true
 		n.votedFor = args.CandidateID
+		n.resetElectionTimer()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -112,6 +115,9 @@ func (n *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error 
 
 // AppendEntries is called by the leader to replicate log entries on followers.
 func (n *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	reply.Success = false
 	reply.Term = n.currentTerm
 
@@ -129,8 +135,23 @@ func (n *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) 
 		return nil
 	}
 
-	if args.PrevLogIndex > 0 && (len(n.log) <= int(args.PrevLogIndex) || n.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
-		return nil
+	//if args.PrevLogIndex > 0 && (len(n.log) <= int(args.PrevLogIndex) || n.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+	//	return nil
+	//}
+
+	if args.PrevLogIndex > 0 {
+		if args.PrevLogIndex >= uint64(len(n.log)-1) {
+			reply.Success = false
+			reply.Term = n.currentTerm
+			return nil
+		}
+		if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.Success = false
+			reply.Term = n.currentTerm
+			// If the logs don't match, truncate the log
+			n.log = n.log[:args.PrevLogIndex]
+			return nil
+		}
 	}
 
 	for i, entry := range args.Entries {
