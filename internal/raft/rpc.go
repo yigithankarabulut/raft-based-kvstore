@@ -1,175 +1,145 @@
 package raft
 
 import (
-	"fmt"
-	"log"
+	"context"
+	"errors"
+
+	"github.com/yigithankarabulut/raft/internal/pb"
+	"google.golang.org/grpc"
 )
 
-// AppendEntriesArgs represents the arguments for appending entries to the log
-type AppendEntriesArgs struct {
-	Term         uint64
-	LeaderID     string
-	PrevLogIndex uint64
-	PrevLogTerm  uint64
-	Entries      []LogEntry
-	LeaderCommit uint64
-}
-
-// AppendEntriesReply represents the reply for appending entries to the log
-type AppendEntriesReply struct {
-	Term    uint64
-	Success bool
-}
-
-// RequestVoteArgs represents the arguments for requesting a vote
-type RequestVoteArgs struct {
-	Term         uint64
-	CandidateID  string
-	LastLogIndex uint64
-	LastLogTerm  uint64
-}
-
-// RequestVoteReply represents the reply for requesting a vote
-type RequestVoteReply struct {
-	Term        uint64
-	VoteGranted bool
-}
-
-func (n *Node) sendRPC(peer string, rpc string, args interface{}, reply interface{}) error {
-	msg := RPCMessage{
-		rpc:   rpc,
-		args:  args,
-		reply: make(chan interface{}),
+func (n *Node) sendRequestVoteRPC(ctx context.Context, peer string, args *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	id, ok := n.peers.Load(peer)
+	if !ok {
+		return nil, errors.New("peer not found")
 	}
-
-	n.PeerChan[peer] <- msg
-	res := <-msg.reply
-
-	switch rpc {
-	case RequestVoteRPC:
-		*reply.(*RequestVoteReply) = res.(RequestVoteReply)
-	case AppendEntriesRPC:
-		*reply.(*AppendEntriesReply) = res.(AppendEntriesReply)
-	default:
-		return fmt.Errorf("unknown RPC: %s", rpc) //nolint:err113
+	conn, err := grpc.Dial(id.(string), grpc.WithInsecure())
+	if err != nil {
+		return nil, err
 	}
+	defer func(conn *grpc.ClientConn) {
+		err := conn.Close()
+		if err != nil {
+			return
+		}
+	}(conn)
 
-	return nil
+	return pb.NewRaftServiceClient(conn).RequestVote(ctx, args)
 }
 
-func (n *Node) handleRPC(msg RPCMessage) {
-	log.Printf("[%s] Handling RPC: %s\n", n.id, msg.rpc)
-	switch msg.rpc {
-	case RequestVoteRPC:
-		args := msg.args.(RequestVoteArgs)
-		reply := RequestVoteReply{}
-		if err := n.RequestVote(args, &reply); err != nil {
-			log.Printf("[%s] Error handling RequestVote RPC: %v\n", n.id, err)
-		}
-		msg.reply <- reply
-	case AppendEntriesRPC:
-		var args AppendEntriesArgs
-		switch v := msg.args.(type) {
-		case *AppendEntriesArgs:
-			args = *v
-		case AppendEntriesArgs:
-			args = v
-		default:
-			panic(fmt.Sprintf("unexpected type %T", msg.args))
-		}
-		reply := AppendEntriesReply{}
-		if err := n.AppendEntries(args, &reply); err != nil {
-			log.Printf("[%s] Error handling AppendEntries RPC: %v\n", n.id, err)
-		}
-		msg.reply <- reply
-	default:
-		log.Printf("[%s] Unknown RPC: %s\n", n.id, msg.rpc)
+func (n *Node) sendAppendEntriesRPC(ctx context.Context, peer string, args *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	id, ok := n.peers.Load(peer)
+	if !ok {
+		return nil, errors.New("peer not found")
 	}
+	conn, err := grpc.Dial(id.(string), grpc.WithInsecure())
+	if err != nil {
+		return nil, err
+	}
+	defer func(conn *grpc.ClientConn) {
+		err := conn.Close()
+		if err != nil {
+			return
+		}
+	}(conn)
+
+	return pb.NewRaftServiceClient(conn).AppendEntries(ctx, args)
 }
 
-// RequestVote is called by candidates to request votes from other nodes in the cluster.
-func (n *Node) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+func (n *Node) RequestVote(ctx context.Context,
+	req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if args.Term < n.currentTerm {
-		reply.Term = n.currentTerm
-		reply.VoteGranted = false
-		return nil
+
+	var res pb.RequestVoteResponse
+
+	if req.Term < n.currentTerm {
+		res = pb.RequestVoteResponse{
+			Term:        n.currentTerm,
+			VoteGranted: false,
+		}
+		return &res, nil
 	}
 
-	if args.Term > n.currentTerm {
-		n.becomeFollower(args.Term)
+	if req.Term > n.currentTerm {
+		n.becomeFollower(req.Term)
 	}
-	if n.votedFor == "" || n.votedFor == args.CandidateID &&
-		n.isLogUpToDate(args.LastLogIndex, args.LastLogTerm) {
-		reply.VoteGranted = true
-		n.votedFor = args.CandidateID
+
+	if n.votedFor == "" || n.votedFor == req.CandidateId &&
+		n.isLogUpToDate(req.LastLogIndex, req.LastLogTerm) {
+		res = pb.RequestVoteResponse{
+			VoteGranted: true,
+		}
+		n.votedFor = req.CandidateId
 		n.resetElectionTimer()
 	} else {
-		reply.VoteGranted = false
+		res = pb.RequestVoteResponse{
+			VoteGranted: false,
+		}
 	}
 
-	reply.Term = n.currentTerm
-	return nil
+	res.Term = n.currentTerm
+	return &res, nil
 }
 
-// AppendEntries is called by the leader to replicate log entries on followers.
-func (n *Node) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+func (n *Node) AppendEntries(ctx context.Context,
+	req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	reply.Success = false
-	reply.Term = n.currentTerm
+	var res pb.AppendEntriesResponse
 
-	if args.Term < n.currentTerm {
-		return nil
+	res.Success = false
+	res.Term = n.currentTerm
+
+	if req.Term < n.currentTerm {
+		return &res, nil
 	}
 
-	if args.Term > n.currentTerm {
-		n.becomeFollower(args.Term)
+	if req.Term > n.currentTerm {
+		n.becomeFollower(req.Term)
 	}
 
 	n.resetElectionTimer()
 
-	if args.PrevLogIndex > uint64(len(n.log)) {
-		return nil
+	if req.PrevLogIndex > uint64(len(n.log)) {
+		return &res, nil
 	}
 
-	//if args.PrevLogIndex > 0 && (len(n.log) <= int(args.PrevLogIndex) || n.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
-	//	return nil
-	//}
-
-	if args.PrevLogIndex > 0 {
-		if args.PrevLogIndex >= uint64(len(n.log)-1) {
-			reply.Success = false
-			reply.Term = n.currentTerm
-			return nil
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex >= uint64(len(n.log)-1) {
+			res.Success = false
+			res.Term = n.currentTerm
+			return &res, nil
 		}
-		if n.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			reply.Success = false
-			reply.Term = n.currentTerm
-			// If the logs don't match, truncate the log
-			n.log = n.log[:args.PrevLogIndex]
-			return nil
+		if n.log[req.PrevLogIndex].Term != req.PrevLogTerm {
+			res.Success = false
+			res.Term = n.currentTerm
+			// if the logs don't match, truncate the log
+			n.log = n.log[:req.PrevLogIndex]
+			return &res, nil
 		}
 	}
 
-	for i, entry := range args.Entries {
-		index := args.PrevLogIndex + uint64(i) + 1
-		if index <= uint64(len(n.log)) {
-			if n.log[index-1].Term != entry.Term {
-				n.log = n.log[:index-1]
-				n.log = append(n.log, entry)
+	// Append new entries
+	for i, entry := range req.Entries {
+		if uint64(i)+req.PrevLogIndex+1 < uint64(len(n.log)) {
+			if n.log[req.PrevLogIndex+uint64(i)+1].Term != entry.Term {
+				n.log = n.log[:req.PrevLogIndex+uint64(i)+1]
+				break
 			}
-		} else {
-			n.log = append(n.log, entry)
 		}
+		n.log = append(n.log, pb.LogEntry{
+			Term:    entry.Term,
+			Index:   entry.Index,
+			Command: entry.Command,
+		})
 	}
 
-	if args.LeaderCommit > n.commitIndex {
-		n.commitIndex = min(args.LeaderCommit, uint64(len(n.log)))
+	if req.LeaderCommit > n.commitIndex {
+		n.commitIndex = min(req.LeaderCommit, uint64(len(n.log)))
 	}
 
-	reply.Success = true
-	return nil
+	res.Success = true
+	return &res, nil
 }

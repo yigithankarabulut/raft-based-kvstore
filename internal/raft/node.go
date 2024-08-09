@@ -1,92 +1,70 @@
 package raft
 
 import (
+	"context"
+	"errors"
 	"log"
 	"math/rand"
+	"net"
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/yigithankarabulut/raft/internal/pb"
+	"google.golang.org/grpc"
 )
 
-// NodeState represents the state of a node.
 type NodeState int
 
 const (
-	// HeartbeatTimeout represents the timeout for sending heartbeats.
-	HeartbeatTimeout = 50 * time.Millisecond
-
-	// RequestVoteRPC represents the request vote RPC.
-	RequestVoteRPC = "RequestVote"
-
-	// AppendEntriesRPC represents the append entries RPC.
-	AppendEntriesRPC = "AppendEntries"
+	HeartbeatTimeout = 300 * time.Millisecond
+	ContextTimeout   = 50 * time.Millisecond
 )
 
 const (
-	// Follower represents the follower state.
 	Follower NodeState = iota
-
-	// Candidate represents the candidate state.
 	Candidate
-
-	// Leader represents the leader state.
 	Leader
 )
 
-// RPCMessage represents an RPC message to be sent.
-type RPCMessage struct {
-	rpc   string
-	args  interface{}
-	reply chan interface{}
-}
-
-// ElectionResult represents the result of an election.
-type ElectionResult struct {
-	votes       int
-	totalVotes  int
-	term        uint64
-	wonElection bool
-}
-
-// Node represents a node in the Raft cluster
 type Node struct {
+	pb.UnimplementedRaftServiceServer
 	id              string
 	state           NodeState
 	currentTerm     uint64
 	votedFor        string
-	log             []LogEntry
+	log             []pb.LogEntry
 	commitIndex     uint64
 	lastApplied     uint64
-	nextIndex       map[string]uint64
-	matchIndex      map[string]uint64
-	peers           []string
+	nextIndex       sync.Map
+	matchIndex      sync.Map
+	peers           sync.Map
 	electionTimeout time.Duration
-	PeerChan        map[string]chan RPCMessage
 	doneCh          chan struct{}
 	mu              sync.Mutex
+	grpcServer      *grpc.Server
 }
 
-// NewNode creates a new Raft node with the given ID, peers, and peer channels
-func NewNode(id string, peers []string, peerChan map[string]chan RPCMessage) *Node {
+func NewNode(id string, peers map[string]string) *Node {
 	n := &Node{
 		id:              id,
 		state:           Follower,
 		currentTerm:     0,
 		votedFor:        "",
-		log:             []LogEntry{{0, 0, nil}},
+		log:             []pb.LogEntry{{Term: 0, Index: 0}},
 		commitIndex:     0,
 		lastApplied:     0,
-		nextIndex:       make(map[string]uint64),
-		matchIndex:      make(map[string]uint64),
-		peers:           peers,
-		electionTimeout: time.Duration(rand.Intn(150)+150) * time.Millisecond, //nolint:gosec
-		PeerChan:        peerChan,
+		nextIndex:       sync.Map{},
+		matchIndex:      sync.Map{},
+		peers:           sync.Map{},
+		electionTimeout: 0,
 		doneCh:          make(chan struct{}),
 		mu:              sync.Mutex{},
 	}
-
-	for _, peer := range peers {
-		n.nextIndex[peer] = 1
-		n.matchIndex[peer] = 0
+	for k, v := range peers {
+		n.peers.Store(k, v)
+		n.nextIndex.Store(k, uint64(1))
+		n.matchIndex.Store(k, uint64(0))
 	}
 
 	n.resetElectionTimer()
@@ -94,117 +72,71 @@ func NewNode(id string, peers []string, peerChan map[string]chan RPCMessage) *No
 	return n
 }
 
-// Start starts the Raft node
-func (n *Node) Start() {
-	log.Printf("[%s] Starting node\n", n.id)
-	go func() {
-		for {
-			select {
-			case <-time.After(n.electionTimeout):
-				if n.state != Leader {
-					n.startElection()
-				}
-			case msg := <-n.PeerChan[n.id]:
-				n.handleRPC(msg)
-
-			case <-n.doneCh:
-				return
-			}
-		}
-	}()
-}
-
-// Stop stops the Raft node
 func (n *Node) Stop() {
 	log.Printf("[%s] Stopping node\n", n.id)
 	n.doneCh <- struct{}{}
 }
 
-// State returns the state of the node
-func (n *Node) State() NodeState {
-	return n.state
-}
+// Start starts the Raft node
+func (n *Node) Start() error {
+	log.Printf("[%s] Starting node\n", n.id)
+	v, _ := n.peers.Load(n.id)
+	log.Printf("listening on %s\n", v)
 
-// Log returns the log of the node
-func (n *Node) Log() []LogEntry {
-	return n.log
-}
-
-// ID returns the ID of the node
-func (n *Node) ID() string {
-	return n.id
-}
-
-// HandleClientRequest handles a client request
-func (n *Node) HandleClientRequest(command []byte) bool {
-	if n.state != Leader {
-		return false
+	lis, err := net.Listen("tcp", v.(string))
+	if err != nil {
+		return err
 	}
 
-	success := n.appendEntries(command)
-	if success {
-		log.Printf("[%s] Append entries: %s\n", n.id, command)
-		n.startReplication()
-	}
+	n.grpcServer = grpc.NewServer()
+	pb.RegisterRaftServiceServer(n.grpcServer, n)
 
-	return success
+	go func() {
+		if err := n.grpcServer.Serve(lis); err != nil {
+			log.Fatalf("Failed to serve: %v", err)
+		}
+	}()
+
+	time.Sleep(3 * time.Second)
+	go n.run()
+
+	return nil
 }
 
-func (n *Node) resetElectionTimer() {
-	log.Printf("[%s] Resetting election timer\n", n.id)
-	n.electionTimeout = time.Duration(rand.Intn(150)+150) * time.Millisecond //nolint:gosec
-}
-
-func (n *Node) startHeartbeat() {
-	log.Printf("[%s] Starting heartbeat\n", n.id)
+func (n *Node) run() {
 	for {
 		select {
 		case <-n.doneCh:
-			log.Printf("[%s] Stopping heartbeat\n", n.id)
+			log.Printf("[%s] Stopping node\n", n.id)
+			n.grpcServer.Stop()
 			return
-		default:
-			if n.state != Leader {
-				log.Printf("[%s] Stopping heartbeat (not a leader)\n", n.id)
-				return
+		case <-time.After(n.electionTimeout):
+			if n.state == Follower {
+				log.Printf("[%s] Starting election\n", n.id)
+				go n.startElection()
 			}
-
-			for _, peer := range n.peers {
-				if peer == n.id {
-					continue
-				}
-
-				log.Printf("[%s] Sending heartbeat to %s\n", n.id, peer)
-
-				go func(peer string) {
-					args := &AppendEntriesArgs{
-						Term:         n.currentTerm,
-						LeaderID:     n.id,
-						PrevLogIndex: n.nextIndex[peer] - 1,
-						PrevLogTerm:  n.log[n.nextIndex[peer]-1].Term,
-						Entries:      []LogEntry{},
-						LeaderCommit: n.commitIndex,
-					}
-
-					var reply AppendEntriesReply
-					if err := n.sendRPC(peer, AppendEntriesRPC, *args, &reply); err != nil {
-						log.Printf("[%s] Error sending heartbeat to %s: %v\n", n.id, peer, err)
-						return
-					}
-
-					if reply.Term > n.currentTerm {
-						log.Printf("[%s] Received higher term from %s\n", n.id, peer)
-						n.becomeFollower(reply.Term)
-					}
-				}(peer)
-
-			}
-			time.Sleep(HeartbeatTimeout)
 		}
 	}
 }
 
+func (n *Node) resetElectionTimer() {
+	log.Printf("[%s] Resetting election timer\n", n.id)
+	n.electionTimeout = time.Duration(rand.Intn(450)+450) * time.Millisecond
+}
+
+func (n *Node) syncMapLen(m *sync.Map) int {
+	var i int
+	m.Range(func(_, _ interface{}) bool {
+		i++
+		return true
+	})
+	return i
+}
+
 func (n *Node) startElection() {
 	log.Printf("[%s] Want to start election (current term: %d)\n", n.id, n.currentTerm)
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	n.state = Candidate
 	n.currentTerm++
 	n.votedFor = n.id
@@ -219,41 +151,41 @@ func (n *Node) startElection() {
 		lastLogTerm = n.log[len(n.log)-1].Term
 	}
 
-	args := &RequestVoteArgs{
+	req := pb.RequestVoteRequest{
 		Term:         n.currentTerm,
-		CandidateID:  n.id,
+		CandidateId:  n.id,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
 
-	// Request votes from peers
-	for _, peer := range n.peers {
-		if peer == n.id {
-			continue
+	n.peers.Range(func(k, v interface{}) bool {
+		if k.(string) == n.id {
+			return true
 		}
 
 		go func(peer string) {
-			var reply RequestVoteReply
 			log.Printf("[%s] Requesting vote from %s\n", n.id, peer)
-			if err := n.sendRPC(peer, RequestVoteRPC, *args, &reply); err != nil {
-				log.Printf("[%s] Error requesting vote from %s: %v\n", n.id, peer, err)
+			ctx := context.Background()
+			res, err := n.sendRequestVoteRPC(ctx, peer, &req)
+			if err != nil {
+				log.Printf("[%s] Error requesting vote from %s %v\n", n.id, peer, err)
 				return
 			}
-
-			if reply.VoteGranted {
+			if res.VoteGranted {
 				votesReceived++
-				if votesReceived > len(n.peers)/2 {
+				if votesReceived > n.syncMapLen(&n.peers)/2 {
 					if n.state == Candidate {
 						log.Printf("[%s] Won election\n", n.id)
 						n.becomeLeader()
 					}
 				}
-			} else if reply.Term > n.currentTerm {
+			} else if res.Term > n.currentTerm {
 				log.Printf("[%s] Received higher term from %s\n", n.id, peer)
-				n.becomeFollower(reply.Term)
+				n.becomeFollower(res.Term)
 			}
-		}(peer)
-	}
+		}(k.(string))
+		return true
+	})
 }
 
 func (n *Node) becomeFollower(term uint64) {
@@ -268,14 +200,17 @@ func (n *Node) becomeLeader() {
 	log.Printf("[%s] Becoming leader\n", n.id)
 	n.state = Leader
 
-	n.appendEntries(nil)
-
-	for _, peer := range n.peers {
-		if peer != n.id {
-			n.nextIndex[peer] = uint64(len(n.log))
-			n.matchIndex[peer] = 0
-		}
+	if err := n.appendEntries([]byte("")); err != nil {
+		log.Printf("[%s] Error appending entries: %v\n", n.id, err)
 	}
+
+	n.peers.Range(func(k, v interface{}) bool {
+		if k.(string) != n.id {
+			n.nextIndex.Store(k, uint64(len(n.log)))
+			n.matchIndex.Store(k, uint64(0))
+		}
+		return true
+	})
 
 	go n.startHeartbeat()
 }
@@ -285,14 +220,71 @@ func (n *Node) becomeCandidate() {
 	n.state = Candidate
 }
 
-func (n *Node) appendEntries(command []byte) bool {
+func (n *Node) startHeartbeat() {
+	log.Printf("[%s] Starting heartbeat\n", n.id)
+	for {
+		select {
+		case <-n.doneCh:
+			log.Printf("[%s] Stopping heartbeat\n", n.id)
+			return
+		default:
+			if n.state != Leader {
+				log.Printf("[%s] Stopping heartbeat (not a leader).\n", n.id)
+				return
+			}
+
+			n.peers.Range(func(k, v interface{}) bool {
+				if k.(string) == n.id {
+					return true
+				}
+
+				log.Printf("[%s] Sending heartbeat to %s\n", n.id, k.(string))
+				go func(peer string) {
+					k, _ := n.nextIndex.Load(peer)
+					log.Printf("[%s] Next index for %s %d\n", n.id, peer, k.(uint64))
+					prevLogIndex := k.(uint64) - 1
+					prevLogTerm := n.log[prevLogIndex].Term
+					req := pb.AppendEntriesRequest{
+						Term:         n.currentTerm,
+						LeaderId:     n.id,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						Entries:      nil,
+						LeaderCommit: n.commitIndex,
+					}
+
+					ctx := context.Background()
+					res, err := n.sendAppendEntriesRPC(ctx, peer, &req)
+					if err != nil {
+						log.Printf("[%s] Error sending heartbeat to %s: %v\n", n.id, peer, err)
+						return
+					}
+
+					if res.Term > n.currentTerm {
+						log.Printf("[%s] Received higher term from %s\n", n.id, peer)
+						n.becomeFollower(res.Term)
+					}
+				}(k.(string))
+
+				time.Sleep(HeartbeatTimeout)
+
+				return true
+			})
+		}
+	}
+}
+
+func (n *Node) appendEntries(command []byte) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
 	if n.state != Leader {
-		return false
+		return errors.New("not a leader")
 	}
 
-	log.Printf("[%s] Appending entries\n", n.id)
+	log.Printf("[%s] Appending entries.\n", n.id)
 
-	entry := LogEntry{
+	entry := pb.LogEntry{
 		Term:    n.currentTerm,
 		Index:   n.log[len(n.log)-1].Index + 1,
 		Command: command,
@@ -300,79 +292,101 @@ func (n *Node) appendEntries(command []byte) bool {
 
 	n.log = append(n.log, entry)
 
-	// Send entries to peers
-	for _, peer := range n.peers {
-		if peer == n.id {
-			continue
+	n.peers.Range(func(k, v interface{}) bool {
+		if k.(string) == n.id {
+			return true
 		}
 
-		go n.sendEntries(peer)
-	}
+		go n.sendEntries(k.(string))
 
-	return true
+		return true
+	})
+
+	return nil
 }
 
 func (n *Node) sendEntries(peer string) {
-	prevLogIndex := n.nextIndex[peer] - 1
-	prevLogTerm := n.log[prevLogIndex].Term
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-	args := &AppendEntriesArgs{
+	k, _ := n.nextIndex.Load(peer)
+
+	prevLogIndex := k.(uint64) - 1
+	if prevLogIndex >= uint64(len(n.log)) || prevLogIndex < 0 {
+		log.Printf("[%s] prevLogIndex out of range: %d\n", n.id, prevLogIndex)
+		return
+	}
+
+	prevLogTerm := n.log[prevLogIndex].Term
+	if k.(uint64) > uint64(len(n.log)) {
+		log.Printf("[%s] nextIndex out of range: %d\n", n.id, k.(uint64))
+		return
+	}
+
+	entries := n.log[k.(uint64):]
+
+	req := pb.AppendEntriesRequest{
 		Term:         n.currentTerm,
-		LeaderID:     n.id,
+		LeaderId:     n.id,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
-		Entries:      n.log[prevLogIndex+1:],
 		LeaderCommit: n.commitIndex,
 	}
 
-	var reply AppendEntriesReply
-	if err := n.sendRPC(peer, AppendEntriesRPC, *args, &reply); err != nil {
+	for _, entry := range entries {
+		req.Entries = append(req.Entries, &pb.LogEntry{
+			Term:    entry.Term,
+			Index:   entry.Index,
+			Command: entry.Command,
+		})
+	}
+
+	ctx := context.Background()
+
+	res, err := n.sendAppendEntriesRPC(ctx, peer, &req)
+	if err != nil {
 		log.Printf("[%s] Error sending entries to %s: %v\n", n.id, peer, err)
 		return
 	}
 
-	if reply.Success {
-		n.nextIndex[peer] = uint64(len(n.log))
-		n.matchIndex[peer] = n.nextIndex[peer] - 1
+	if res.Success {
+		n.nextIndex.Store(peer, uint64(len(n.log)))
+		v, _ := n.nextIndex.Load(peer)
+		n.matchIndex.Store(peer, v.(uint64)-1)
 		n.updateCommitIndex()
 	} else {
-		if reply.Term > n.currentTerm {
+		if res.Term > n.currentTerm {
 			log.Printf("[%s] Received higher term from %s\n", n.id, peer)
-			n.becomeFollower(reply.Term)
+			n.becomeFollower(res.Term)
 		} else {
-			n.nextIndex[peer]--
+			v, _ := n.nextIndex.Load(peer)
+			n.nextIndex.Store(peer, v.(uint64)-1)
 		}
 	}
 }
 
 func (n *Node) updateCommitIndex() {
-	for i := n.commitIndex + 1; i <= uint64(len(n.log)); i++ {
-		if n.log[i-1].Term == n.currentTerm {
-			matchCount := 1
-			for _, peer := range n.peers {
-				if n.matchIndex[peer] >= i {
-					matchCount++
-				}
-			}
-			if matchCount > len(n.peers)/2 {
-				n.commitIndex = i
-				go n.applyCommittedEntries()
-			} else {
-				break // Entries are not replicated on majority of servers
-			}
-		}
-	}
-}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 
-func (n *Node) applyCommittedEntries() {
-	for i := n.lastApplied + 1; i <= n.commitIndex; i++ {
-		entry := n.log[i-1]
-		log.Printf("[%s] Applying log entry %d: %v\n", n.id, i, entry)
-		n.lastApplied = i
-	}
+	var matchIndexes []uint64
+	n.matchIndex.Range(func(_, v interface{}) bool {
+		matchIndexes = append(matchIndexes, v.(uint64))
+		return true
+	})
+
+	sort.Slice(matchIndexes, func(i, j int) bool {
+		return matchIndexes[i] < matchIndexes[j]
+	})
+
+	n.commitIndex = matchIndexes[len(matchIndexes)/2]
+
+	log.Printf("[%s] Commit index updated: %d\n", n.id, n.commitIndex)
 }
 
 func (n *Node) isLogUpToDate(lastLogIndex, lastLogTerm uint64) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	var index int
 	if len(n.log) != 0 {
 		index = len(n.log) - 1
@@ -381,6 +395,7 @@ func (n *Node) isLogUpToDate(lastLogIndex, lastLogTerm uint64) bool {
 	if lastLogTerm > n.log[index].Term {
 		return true
 	}
+
 	if lastLogTerm == n.log[index].Term && lastLogIndex >= n.log[index].Index {
 		return true
 	}
